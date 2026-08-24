@@ -3,7 +3,11 @@ import re
 import zipfile
 from pathlib import Path
 
-# Only these placeholders are allowed to change.
+
+# ============================================================
+# ONLY THESE FIELDS ARE ALLOWED TO CHANGE
+# ============================================================
+
 PLACEHOLDERS = {
     "{{ACCOUNT_NO}}": "account_number",
     "{{CUSTOMER_ID}}": "customer_id",
@@ -12,18 +16,29 @@ PLACEHOLDERS = {
     "{{PIN_CODE}}": "pin_code",
 }
 
-# These fields are locked and must remain exactly as in the template.
-FIXED_VALUES = {
+
+# ============================================================
+# THESE VALUES ARE LOCKED
+# THEY MUST NEVER BE CHANGED
+# ============================================================
+
+FIXED_VALUES = [
     "BRANCH - JORJA",
     "PUNB0MBGB06",
     "RAVISH KUMAR SAH",
     "PAGHARI CHOWK, 847105",
-}
+]
 
 
-def _escape_xml(value):
+# ============================================================
+# XML ESCAPE
+# ============================================================
+
+def escape_xml(value):
+    value = str(value)
+
     return (
-        str(value)
+        value
         .replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
@@ -32,171 +47,594 @@ def _escape_xml(value):
     )
 
 
-def _replace_placeholder_in_paragraph(paragraph_xml, token, value):
-    """Replace a token even when Word split it across multiple text runs."""
-    nodes = list(re.finditer(
-        r"<w:t([^>]*)>(.*?)</w:t>",
+# ============================================================
+# GET TEXT FROM A WORD PARAGRAPH
+# ============================================================
+
+def get_paragraph_text(paragraph_xml):
+    """
+    Word often splits text into multiple <w:t> runs.
+
+    Example:
+
+    {{CUSTOMER_ID}}
+
+    can internally become:
+
+    {{CUST
+    OMER_
+    ID}}
+
+    This function joins all visible text.
+    """
+
+    nodes = re.findall(
+        r"<w:t\b[^>]*>(.*?)</w:t>",
         paragraph_xml,
-        re.I | re.S
-    ))
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    return "".join(nodes)
+
+
+# ============================================================
+# REPLACE PLACEHOLDER EVEN IF WORD SPLITS IT INTO RUNS
+# ============================================================
+
+def replace_placeholder_in_paragraph(
+    paragraph_xml,
+    placeholder,
+    replacement,
+):
+    """
+    Safely replaces a {{PLACEHOLDER}} even when Microsoft Word
+    has split that placeholder across multiple XML text runs.
+
+    Formatting of the first run is preserved.
+    """
+
+    nodes = list(
+        re.finditer(
+            r"<w:t\b([^>]*)>(.*?)</w:t>",
+            paragraph_xml,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+    )
+
     if not nodes:
         return paragraph_xml, False
 
-    visible = ""
-    spans = []
-    for node in nodes:
-        content = re.sub(r"<[^>]+>", "", node.group(2))
-        start = len(visible)
-        visible += content
-        spans.append((start, len(visible), node))
+    # --------------------------------------------------------
+    # Build visible text and map every character to a run
+    # --------------------------------------------------------
 
-    pos = visible.find(token)
-    if pos < 0:
+    visible_text = ""
+
+    run_ranges = []
+
+    for node in nodes:
+        text = node.group(2)
+
+        start = len(visible_text)
+        visible_text += text
+        end = len(visible_text)
+
+        run_ranges.append(
+            {
+                "node": node,
+                "start": start,
+                "end": end,
+            }
+        )
+
+    # --------------------------------------------------------
+    # Find placeholder
+    # --------------------------------------------------------
+
+    position = visible_text.find(placeholder)
+
+    if position == -1:
         return paragraph_xml, False
 
-    end = pos + len(token)
-    touched = [
-        node for start, stop, node in spans
-        if stop > pos and start < end
-    ]
+    placeholder_end = position + len(placeholder)
+
+    # --------------------------------------------------------
+    # Find all runs touched by placeholder
+    # --------------------------------------------------------
+
+    touched = []
+
+    for item in run_ranges:
+
+        if (
+            item["end"] > position
+            and item["start"] < placeholder_end
+        ):
+            touched.append(item)
+
     if not touched:
         return paragraph_xml, False
 
-    first = touched[0]
-    last = touched[-1]
+    first_run = touched[0]
+    last_run = touched[-1]
 
-    first_start = next(
-        start for start, stop, node in spans if node is first
-    )
-    last_stop = next(
-        stop for start, stop, node in spans if node is last
+    first_text = first_run["node"].group(2)
+    last_text = last_run["node"].group(2)
+
+    # --------------------------------------------------------
+    # Text before placeholder in first run
+    # --------------------------------------------------------
+
+    first_start_inside = position - first_run["start"]
+
+    prefix = first_text[:first_start_inside]
+
+    # --------------------------------------------------------
+    # Text after placeholder in last run
+    # --------------------------------------------------------
+
+    last_end_inside = placeholder_end - last_run["start"]
+
+    suffix = last_text[last_end_inside:]
+
+    # --------------------------------------------------------
+    # New content
+    # --------------------------------------------------------
+
+    new_text = (
+        prefix
+        + str(replacement)
+        + suffix
     )
 
-    replacement = (
-        visible[first_start:pos]
-        + str(value)
-        + visible[end:last_stop]
-    )
+    new_text = escape_xml(new_text)
 
-    first_xml = (
-        f"<w:t{first.group(1)}>{_escape_xml(replacement)}</w:t>"
+    # --------------------------------------------------------
+    # Replace first run
+    # --------------------------------------------------------
+
+    first_node = first_run["node"]
+
+    first_replacement = (
+        f"<w:t{first_node.group(1)}>"
+        f"{new_text}"
+        f"</w:t>"
     )
 
     replacements = []
-    for node in touched:
-        if node is first:
-            replacements.append((node.start(), node.end(), first_xml))
-        else:
-            replacements.append((
+
+    replacements.append(
+        (
+            first_node.start(),
+            first_node.end(),
+            first_replacement,
+        )
+    )
+
+    # --------------------------------------------------------
+    # Empty all remaining touched runs
+    # --------------------------------------------------------
+
+    for item in touched[1:]:
+
+        node = item["node"]
+
+        empty_run = (
+            f"<w:t{node.group(1)}></w:t>"
+        )
+
+        replacements.append(
+            (
                 node.start(),
                 node.end(),
-                f"<w:t{node.group(1)}></w:t>"
-            ))
+                empty_run,
+            )
+        )
 
-    for start, stop, repl in reversed(replacements):
-        paragraph_xml = paragraph_xml[:start] + repl + paragraph_xml[stop:]
+    # --------------------------------------------------------
+    # Apply replacements backwards
+    # --------------------------------------------------------
+
+    for start, end, replacement_text in reversed(
+        replacements
+    ):
+
+        paragraph_xml = (
+            paragraph_xml[:start]
+            + replacement_text
+            + paragraph_xml[end:]
+        )
 
     return paragraph_xml, True
 
 
-def _replace_all_placeholders(xml, data):
-    paragraphs = list(re.finditer(
-        r"<w:p\b.*?</w:p>",
-        xml,
-        re.I | re.S
-    ))
+# ============================================================
+# REPLACE ALL PLACEHOLDERS IN DOCUMENT
+# ============================================================
 
-    for pm in reversed(paragraphs):
-        paragraph = pm.group(0)
+def replace_all_placeholders(xml, data):
 
-        for token, key in PLACEHOLDERS.items():
-            while token in paragraph:
-                new_paragraph, changed = _replace_placeholder_in_paragraph(
-                    paragraph, token, data[key]
+    # Find every Word paragraph.
+    paragraphs = list(
+        re.finditer(
+            r"<w:p\b.*?</w:p>",
+            xml,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+    )
+
+    # Work backwards so XML positions remain correct.
+    for paragraph_match in reversed(paragraphs):
+
+        original_paragraph = paragraph_match.group(0)
+
+        paragraph = original_paragraph
+
+        # ----------------------------------------------------
+        # Replace every allowed placeholder
+        # ----------------------------------------------------
+
+        for placeholder, data_key in PLACEHOLDERS.items():
+
+            while True:
+
+                new_paragraph, changed = (
+                    replace_placeholder_in_paragraph(
+                        paragraph,
+                        placeholder,
+                        data[data_key],
+                    )
                 )
+
                 if not changed:
                     break
+
                 paragraph = new_paragraph
 
-        if paragraph != pm.group(0):
-            xml = xml[:pm.start()] + paragraph + xml[pm.end():]
+        # ----------------------------------------------------
+        # Put modified paragraph back into document
+        # ----------------------------------------------------
+
+        if paragraph != original_paragraph:
+
+            xml = (
+                xml[:paragraph_match.start()]
+                + paragraph
+                + xml[paragraph_match.end():]
+            )
 
     return xml
 
 
-def _remaining_placeholders(xml):
-    return sorted(set(re.findall(r"\{\{[A-Z0-9_]+\}\}", xml)))
+# ============================================================
+# CHECK REMAINING PLACEHOLDERS
+# ============================================================
+
+def find_remaining_placeholders(xml):
+
+    # Reconstruct visible text from every Word text run.
+    text_nodes = re.findall(
+        r"<w:t\b[^>]*>(.*?)</w:t>",
+        xml,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    visible_text = "".join(text_nodes)
+
+    return sorted(
+        set(
+            re.findall(
+                r"\{\{[A-Z0-9_]+\}\}",
+                visible_text,
+            )
+        )
+    )
 
 
-def build_docx(template_file, output, data):
+# ============================================================
+# CHECK LOCKED FIELDS
+# ============================================================
+
+def check_fixed_fields(xml):
+
+    text_nodes = re.findall(
+        r"<w:t\b[^>]*>(.*?)</w:t>",
+        xml,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    visible_text = "".join(text_nodes)
+
+    # XML decode common entities.
+    visible_text = (
+        visible_text
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", '"')
+        .replace("&apos;", "'")
+    )
+
+    missing = []
+
+    for fixed_value in FIXED_VALUES:
+
+        if fixed_value not in visible_text:
+            missing.append(fixed_value)
+
+    return missing
+
+
+# ============================================================
+# BUILD FINAL DOCX
+# ============================================================
+
+def build_docx(
+    template_file,
+    output,
+    data,
+):
+    """
+    Reads the existing DOCX template and changes ONLY
+    {{...}} placeholders.
+
+    The document is NOT rebuilt from scratch.
+    """
+
     template_file = Path(template_file)
 
     if not template_file.exists():
-        raise FileNotFoundError(f"Template not found: {template_file}")
 
-    with zipfile.ZipFile(template_file, "r") as zin:
-        files = {name: zin.read(name) for name in zin.namelist()}
-
-    xml = files["word/document.xml"].decode("utf-8")
-
-    # Make sure the template really has the mapping the tool expects.
-    missing = [token for token in PLACEHOLDERS if token not in xml]
-    if missing:
-        raise ValueError(
-            "Template mapping missing: " + ", ".join(missing)
+        raise FileNotFoundError(
+            f"Template not found: {template_file}"
         )
 
-    # Replace ONLY {{...}} fields.
-    xml = _replace_all_placeholders(xml, data)
+    # --------------------------------------------------------
+    # Open DOCX
+    # --------------------------------------------------------
 
-    remaining = _remaining_placeholders(xml)
+    with zipfile.ZipFile(
+        template_file,
+        "r",
+    ) as source:
+
+        files = {
+            name: source.read(name)
+            for name in source.namelist()
+        }
+
+    # --------------------------------------------------------
+    # Word document XML
+    # --------------------------------------------------------
+
+    if "word/document.xml" not in files:
+
+        raise ValueError(
+            "Invalid DOCX: word/document.xml not found."
+        )
+
+    xml = files[
+        "word/document.xml"
+    ].decode(
+        "utf-8"
+    )
+
+    # --------------------------------------------------------
+    # Required data validation
+    # --------------------------------------------------------
+
+    required_fields = [
+        "account_number",
+        "customer_id",
+        "name",
+        "address",
+        "pin_code",
+    ]
+
+    for field in required_fields:
+
+        value = data.get(field)
+
+        if value is None or str(value).strip() == "":
+
+            raise ValueError(
+                f"Required field is empty: {field}"
+            )
+
+    # --------------------------------------------------------
+    # Replace placeholders
+    # --------------------------------------------------------
+
+    xml = replace_all_placeholders(
+        xml,
+        data,
+    )
+
+    # --------------------------------------------------------
+    # Make sure NO placeholder remains
+    # --------------------------------------------------------
+
+    remaining = find_remaining_placeholders(
+        xml
+    )
+
     if remaining:
+
         raise ValueError(
-            "Unmapped placeholders remain: " + ", ".join(remaining)
+            "Unmapped placeholders remain: "
+            + ", ".join(remaining)
         )
 
-    # Safety lock: fixed fields must still be present.
-    for fixed in FIXED_VALUES:
-        if fixed not in xml:
-            raise ValueError(
-                f"Fixed field was changed or removed: {fixed}"
-            )
+    # --------------------------------------------------------
+    # Make sure locked fields were NOT changed
+    # --------------------------------------------------------
 
-    files["word/document.xml"] = xml.encode("utf-8")
+    missing_fixed = check_fixed_fields(
+        xml
+    )
 
-    if hasattr(output, "write"):
-        with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as zout:
-            for name, content in files.items():
-                zout.writestr(name, content)
-    else:
-        output = Path(output)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as zout:
-            for name, content in files.items():
-                zout.writestr(name, content)
+    if missing_fixed:
 
+        raise ValueError(
+            "A locked field was changed or removed: "
+            + ", ".join(missing_fixed)
+        )
 
-def verify_result(docx_bytes, data):
-    with zipfile.ZipFile(io.BytesIO(docx_bytes), "r") as z:
-        xml = z.read("word/document.xml").decode("utf-8")
+    # --------------------------------------------------------
+    # Put modified XML back
+    # --------------------------------------------------------
 
-    for value in (
-        data["account_number"],
-        data["customer_id"],
-        data["name"],
-        data["address"],
-        data["pin_code"],
+    files[
+        "word/document.xml"
+    ] = xml.encode(
+        "utf-8"
+    )
+
+    # --------------------------------------------------------
+    # Create final DOCX
+    # --------------------------------------------------------
+
+    if hasattr(
+        output,
+        "write",
     ):
-        if value not in xml:
-            raise ValueError("Final DOCX verification failed.")
 
-    for fixed in FIXED_VALUES:
-        if fixed not in xml:
+        with zipfile.ZipFile(
+            output,
+            "w",
+            zipfile.ZIP_DEFLATED,
+        ) as destination:
+
+            for name, content in files.items():
+
+                destination.writestr(
+                    name,
+                    content,
+                )
+
+    else:
+
+        output = Path(output)
+
+        output.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        with zipfile.ZipFile(
+            output,
+            "w",
+            zipfile.ZIP_DEFLATED,
+        ) as destination:
+
+            for name, content in files.items():
+
+                destination.writestr(
+                    name,
+                    content,
+                )
+
+
+# ============================================================
+# FINAL DOCX VERIFICATION
+# ============================================================
+
+def verify_result(
+    docx_bytes,
+    data,
+):
+    """
+    Final safety check before allowing download.
+    """
+
+    with zipfile.ZipFile(
+        io.BytesIO(docx_bytes),
+        "r",
+    ) as archive:
+
+        if "word/document.xml" not in archive.namelist():
+
             raise ValueError(
-                f"Final DOCX verification failed: fixed field missing: {fixed}"
+                "Generated DOCX is invalid."
             )
 
-    if _remaining_placeholders(xml):
-        raise ValueError("Final DOCX still contains an unmapped placeholder.")
+        xml = archive.read(
+            "word/document.xml"
+        ).decode(
+            "utf-8"
+        )
+
+    # --------------------------------------------------------
+    # Verify customer fields
+    # --------------------------------------------------------
+
+    text_nodes = re.findall(
+        r"<w:t\b[^>]*>(.*?)</w:t>",
+        xml,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    visible_text = "".join(
+        text_nodes
+    )
+
+    visible_text = (
+        visible_text
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", '"')
+        .replace("&apos;", "'")
+    )
+
+    for field in [
+        "account_number",
+        "customer_id",
+        "name",
+        "address",
+        "pin_code",
+    ]:
+
+        value = str(
+            data[field]
+        )
+
+        if value not in visible_text:
+
+            raise ValueError(
+                "Final DOCX verification failed for "
+                + field
+            )
+
+    # --------------------------------------------------------
+    # Verify locked fields
+    # --------------------------------------------------------
+
+    missing_fixed = check_fixed_fields(
+        xml
+    )
+
+    if missing_fixed:
+
+        raise ValueError(
+            "Final DOCX verification failed. "
+            "Locked field missing: "
+            + ", ".join(missing_fixed)
+        )
+
+    # --------------------------------------------------------
+    # Verify no placeholders remain
+    # --------------------------------------------------------
+
+    remaining = find_remaining_placeholders(
+        xml
+    )
+
+    if remaining:
+
+        raise ValueError(
+            "Final DOCX still contains placeholders: "
+            + ", ".join(remaining)
+        )
 
     return True
