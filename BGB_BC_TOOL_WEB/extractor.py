@@ -9,10 +9,33 @@ import pdfplumber
 
 def clean(value):
     """
-    Normalize repeated whitespace without changing
-    the actual content.
+    Normalize whitespace while preserving actual content.
     """
-    return re.sub(r"\s+", " ", value or "").strip()
+    if value is None:
+        return ""
+
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+# ============================================================
+# NORMALIZE FOR COMPARISON
+# ============================================================
+
+def normalize_for_match(value):
+    """
+    Used only for matching labels.
+    """
+    if value is None:
+        return ""
+
+    value = str(value)
+    value = value.replace("\xa0", " ")
+
+    return re.sub(
+        r"\s+",
+        "",
+        value
+    ).lower()
 
 
 # ============================================================
@@ -21,23 +44,53 @@ def clean(value):
 
 def lines_from_pdf(pdf_bytes):
     """
-    Extract selectable text from all PDF pages.
+    Extract selectable text from every page of the PDF.
     """
 
-    with pdfplumber.open(
-        io.BytesIO(pdf_bytes)
-    ) as pdf:
+    if not pdf_bytes:
+        raise ValueError("Empty PDF file.")
 
-        pages = [
-            page.extract_text() or ""
-            for page in pdf.pages
-        ]
+    try:
+        with pdfplumber.open(
+            io.BytesIO(pdf_bytes)
+        ) as pdf:
+
+            pages = []
+
+            for page in pdf.pages:
+                text = page.extract_text(
+                    x_tolerance=2,
+                    y_tolerance=3
+                ) or ""
+
+                pages.append(text)
+
+    except Exception as exc:
+        raise ValueError(
+            "Unable to read PDF: " + str(exc)
+        )
 
     return "\n".join(pages)
 
 
 # ============================================================
-# EXTRACT VALUE AFTER LABEL
+# GET CLEAN LINES
+# ============================================================
+
+def get_lines(text):
+    """
+    Convert extracted PDF text into clean non-empty lines.
+    """
+
+    return [
+        clean(line)
+        for line in text.splitlines()
+        if clean(line)
+    ]
+
+
+# ============================================================
+# FIND VALUE AFTER LABEL
 # ============================================================
 
 def after_label(
@@ -46,276 +99,688 @@ def after_label(
     value_pattern,
 ):
     """
-    Finds a label and searches the following few lines
-    for the required value.
+    Find a field label and search nearby lines for its value.
+
+    Works when:
+        Label
+        Value
+
+    and also when:
+        Label: Value
     """
 
-    labels = [
-        re.sub(
-            r"\s+",
-            "",
-            x
-        ).lower()
-        for x in labels
-    ]
+    label_patterns = []
 
-    for i, raw in enumerate(lines):
+    for label in labels:
 
-        compact = re.sub(
-            r"\s+",
-            "",
-            raw
-        ).lower()
+        compact = normalize_for_match(label)
 
-        if any(
-            label in compact
-            for label in labels
-        ):
+        label_patterns.append(
+            compact
+        )
 
-            for j in range(
-                i + 1,
-                min(
-                    i + 4,
-                    len(lines)
-                ),
-            ):
+    regex = re.compile(
+        value_pattern,
+        re.IGNORECASE
+    )
+
+    for i, raw_line in enumerate(lines):
+
+        line = clean(raw_line)
+
+        compact_line = normalize_for_match(
+            line
+        )
+
+        matched_label = any(
+            label in compact_line
+            for label in label_patterns
+        )
+
+        if not matched_label:
+            continue
+
+        # ----------------------------------------------------
+        # First check value on same line
+        # ----------------------------------------------------
+
+        for label in labels:
+
+            escaped_label = re.escape(
+                label
+            )
+
+            same_line_pattern = re.compile(
+                escaped_label
+                + r"\s*:?\s*(.+)$",
+                re.IGNORECASE
+            )
+
+            same_match = same_line_pattern.search(
+                line
+            )
+
+            if same_match:
 
                 candidate = clean(
-                    lines[j]
+                    same_match.group(1)
                 )
 
-                if not candidate:
-                    continue
+                if candidate:
 
-                # Skip other labels
-                if re.match(
-                    r"^(sex|account\s*no|customer\s*id|aadhaar\s*no|mobile\s*no)$",
-                    candidate,
-                    re.I,
-                ):
-                    continue
-
-                match = re.search(
-                    value_pattern,
-                    candidate,
-                    re.I,
-                )
-
-                if match:
-                    return clean(
-                        match.group(1)
+                    value_match = regex.search(
+                        candidate
                     )
+
+                    if value_match:
+                        return clean(
+                            value_match.group(1)
+                        )
+
+        # ----------------------------------------------------
+        # Then search next few lines
+        # ----------------------------------------------------
+
+        for j in range(
+            i + 1,
+            min(
+                i + 7,
+                len(lines)
+            )
+        ):
+
+            candidate = clean(
+                lines[j]
+            )
+
+            if not candidate:
+                continue
+
+            # Skip obvious labels.
+            compact_candidate = normalize_for_match(
+                candidate
+            )
+
+            if any(
+                normalize_for_match(label)
+                == compact_candidate
+                for label in [
+                    "Sex",
+                    "Account No",
+                    "Customer ID",
+                    "Customer IDss",
+                    "Aadhaar No",
+                    "Mobile No",
+                    "Date of Birth",
+                    "Customer Name",
+                ]
+            ):
+                continue
+
+            match = regex.search(
+                candidate
+            )
+
+            if match:
+
+                return clean(
+                    match.group(1)
+                )
 
     return ""
 
 
 # ============================================================
-# REMOVE ONLY THE UNWANTED AOF CODE
+# EXTRACT ACCOUNT NUMBER
+# ============================================================
+
+def extract_account_number(lines):
+
+    # Normal form
+    value = after_label(
+        lines,
+        [
+            "Account No",
+            "Account Number",
+            "A/C No",
+            "A/C Number",
+            "AccountNo",
+            "AccountNumber",
+        ],
+        r"^(\d{8,20})$",
+    )
+
+    if value:
+        return value
+
+    # Fallback:
+    # Search lines near account-related labels.
+    account_label_re = re.compile(
+        r"account\s*(?:no|number)"
+        r"|a/?c\s*(?:no|number)",
+        re.IGNORECASE
+    )
+
+    for i, line in enumerate(lines):
+
+        if not account_label_re.search(line):
+            continue
+
+        for candidate in lines[
+            i:i + 5
+        ]:
+
+            numbers = re.findall(
+                r"\b\d{8,20}\b",
+                candidate
+            )
+
+            if numbers:
+                return numbers[0]
+
+    return ""
+
+
+# ============================================================
+# EXTRACT CUSTOMER ID
+# ============================================================
+
+def extract_customer_id(lines):
+
+    value = after_label(
+        lines,
+        [
+            "Customer ID",
+            "Customer IDss",
+            "CustomerID",
+            "Customer Id",
+        ],
+        r"^([A-Z0-9]{6,30})$",
+    )
+
+    if value:
+        return value.upper()
+
+    # --------------------------------------------------------
+    # More tolerant fallback
+    # --------------------------------------------------------
+
+    label_re = re.compile(
+        r"customer\s*id",
+        re.IGNORECASE
+    )
+
+    for i, line in enumerate(lines):
+
+        if not label_re.search(line):
+            continue
+
+        # Same line
+        candidate = re.sub(
+            r"^.*?customer\s*id\s*:?\s*",
+            "",
+            line,
+            flags=re.IGNORECASE
+        ).strip()
+
+        if re.fullmatch(
+            r"[A-Z0-9]{6,30}",
+            candidate,
+            re.IGNORECASE
+        ):
+            return candidate.upper()
+
+        # Next lines
+        for next_line in lines[
+            i + 1:i + 6
+        ]:
+
+            candidate = clean(
+                next_line
+            )
+
+            if re.fullmatch(
+                r"[A-Z0-9]{6,30}",
+                candidate,
+                re.IGNORECASE
+            ):
+                return candidate.upper()
+
+    return ""
+
+
+# ============================================================
+# EXTRACT CUSTOMER NAME
+# ============================================================
+
+def extract_name(lines):
+
+    value = after_label(
+        lines,
+        [
+            "Customer Name",
+            "CustomerName",
+            "Name of Customer",
+            "Name",
+        ],
+        r"^(.+)$",
+    )
+
+    if value:
+        return value
+
+    return ""
+
+
+# ============================================================
+# EXTRACT DOB
+# ============================================================
+
+def extract_dob(lines):
+
+    value = after_label(
+        lines,
+        [
+            "Date of Birth",
+            "Date Of Birth",
+            "DOB",
+        ],
+        r"^(\d{4}-\d{2}-\d{2})$",
+    )
+
+    if value:
+        return value
+
+    # Additional common date formats
+    date_re = re.compile(
+        r"\b("
+        r"\d{4}-\d{2}-\d{2}"
+        r"|"
+        r"\d{2}-\d{2}-\d{4}"
+        r"|"
+        r"\d{2}/\d{2}/\d{4}"
+        r")\b"
+    )
+
+    for i, line in enumerate(lines):
+
+        if re.search(
+            r"date\s*of\s*birth|dob",
+            line,
+            re.IGNORECASE
+        ):
+
+            for candidate in lines[
+                i:i + 5
+            ]:
+
+                match = date_re.search(
+                    candidate
+                )
+
+                if match:
+                    return match.group(1)
+
+    return ""
+
+
+# ============================================================
+# EXTRACT AADHAAR
+# ============================================================
+
+def extract_aadhaar(lines):
+
+    value = after_label(
+        lines,
+        [
+            "Aadhaar No",
+            "Aadhaar Number",
+            "Aadhar No",
+            "Aadhar Number",
+        ],
+        r"^([Xx\d\s-]{4,25})$",
+    )
+
+    if value:
+        return clean(value)
+
+    return ""
+
+
+# ============================================================
+# EXTRACT MOBILE
+# ============================================================
+
+def extract_mobile(lines):
+
+    value = after_label(
+        lines,
+        [
+            "Mobile No",
+            "Mobile Number",
+            "MobileNo",
+            "Mobile",
+        ],
+        r"^(\d{10})$",
+    )
+
+    if value:
+        return value
+
+    return ""
+
+
+# ============================================================
+# REMOVE UNWANTED AOF FRAGMENT
 # ============================================================
 
 def clean_address(address):
-    """
-    Removes ONLY the unwanted sequence:
-
-        01716, 195
-
-    from the extracted address.
-
-    Nothing else in the address is intentionally removed.
-    """
 
     if not address:
         return ""
 
     address = str(address)
 
-    # Remove exactly:
-    # 01716, 195
+    # --------------------------------------------------------
+    # Remove unwanted fragment:
     #
-    # Allows different spacing around comma.
+    # 01716, 195
+    # 01719, 195
+    # --------------------------------------------------------
+    #
+    # The AOF can contain slightly different 017xx codes.
+    # We remove only this specific pattern.
+    # --------------------------------------------------------
+
     address = re.sub(
-        r"\b01716\s*,\s*195\b",
+        r"\b017\d{2}\s*,\s*195\b",
         "",
         address,
-        flags=re.IGNORECASE,
+        flags=re.IGNORECASE
     )
 
-    # Remove duplicate spaces created by deletion.
+    # Also support spaces around the comma.
     address = re.sub(
-        r"[ \t]{2,}",
-        " ",
+        r"\b017\d{2}\s*,\s*195\b",
+        "",
         address,
+        flags=re.IGNORECASE
     )
 
-    # Clean comma spacing.
+    # --------------------------------------------------------
+    # Normalize spaces
+    # --------------------------------------------------------
+
+    address = re.sub(
+        r"\s+",
+        " ",
+        address
+    )
+
+    # --------------------------------------------------------
+    # Normalize comma spacing
+    # --------------------------------------------------------
+
     address = re.sub(
         r"\s*,\s*",
         ", ",
-        address,
+        address
     )
 
-    # Remove comma immediately before another comma.
+    # --------------------------------------------------------
+    # Remove duplicate commas
+    # --------------------------------------------------------
+
     address = re.sub(
         r",\s*,+",
         ", ",
-        address,
+        address
     )
 
-    # Remove comma before end of address.
+    # --------------------------------------------------------
+    # Remove comma before end
+    # --------------------------------------------------------
+
     address = re.sub(
         r",\s*$",
         "",
-        address,
+        address
     )
 
     return address.strip(" ,")
 
 
 # ============================================================
-# MAIN AOF EXTRACTION
+# EXTRACT PIN FROM A STRING
 # ============================================================
 
-def extract_aof(pdf_bytes):
+def extract_pin_from_text(text):
 
-    text = lines_from_pdf(
-        pdf_bytes
-    )
+    if not text:
+        return ""
 
-    lines = [
-        x.strip()
-        for x in text.splitlines()
-        if x.strip()
+    text = str(text)
+
+    # --------------------------------------------------------
+    # First: explicit PIN-related labels
+    # --------------------------------------------------------
+
+    patterns = [
+        r"(?:pin\s*code|pincode|pin)\s*[:\-]?\s*(\d{6})\b",
+        r"(?:with\s*pincode|pincode)\s*[:\-]?\s*(\d{6})\b",
     ]
 
-    # ========================================================
-    # BASIC AOF FIELDS
-    # ========================================================
+    for pattern in patterns:
 
-    name = after_label(
-        lines,
-        ["Customer Name"],
-        r"^(.+)$",
+        match = re.search(
+            pattern,
+            text,
+            re.IGNORECASE
+        )
+
+        if match:
+            return match.group(1)
+
+    # --------------------------------------------------------
+    # Second: any standalone 6-digit PIN
+    # --------------------------------------------------------
+
+    matches = re.findall(
+        r"(?<!\d)(\d{6})(?!\d)",
+        text
     )
 
-    account = after_label(
-        lines,
-        ["Account No"],
-        r"^(\d{8,20})$",
-    )
+    # Return the last 6-digit number.
+    #
+    # In these AOF address layouts, PIN is normally
+    # near the end of the address.
+    if matches:
 
-    customer_id = after_label(
-        lines,
-        [
-            "Customer ID",
-            "Customer IDss",
-        ],
-        r"^([A-Z0-9]{6,30})$",
-    )
+        return matches[-1]
 
-    dob = after_label(
-        lines,
-        ["Date of Birth"],
-        r"^(\d{4}-\d{2}-\d{2})$",
-    )
+    return ""
 
-    aadhaar = after_label(
-        lines,
-        ["Aadhaar No"],
-        r"^([Xx\d]{4,20})$",
-    )
 
-    mobile = after_label(
-        lines,
-        ["Mobile No"],
-        r"^(\d{10})$",
-    )
+# ============================================================
+# EXTRACT ADDRESS
+# ============================================================
 
-    # ========================================================
-    # ADDRESS EXTRACTION
-    # ========================================================
+def extract_address(lines):
 
     address_parts = []
 
     compact_lines = [
-        re.sub(
-            r"\s+",
-            "",
-            x
-        ).lower()
-        for x in lines
+        normalize_for_match(line)
+        for line in lines
     ]
+
+    # --------------------------------------------------------
+    # Known AOF address labels
+    # --------------------------------------------------------
+
+    address_label_patterns = [
+        "flatno./bldg.name",
+        "flatno./bldgname",
+        "flatno/bldg.name",
+        "flatno/bldgname",
+        "street/road/locality",
+        "street/road/locality",
+        "city/district/statewithpincode",
+        "city/district/statewithpin",
+        "city/district/state",
+    ]
+
+    found_address_label = False
 
     for i, compact in enumerate(
         compact_lines
     ):
 
-        # ----------------------------------------------------
-        # Flat / Building
-        # ----------------------------------------------------
+        matched = False
 
-        if compact.startswith(
-            "flatno./bldg.name"
-        ):
+        for label in address_label_patterns:
 
-            if i + 1 < len(lines):
-
-                address_parts.append(
-                    lines[i + 1]
-                )
-
-        # ----------------------------------------------------
-        # Street / Road / Locality
-        # ----------------------------------------------------
-
-        elif compact.startswith(
-            "street/road/locality"
-        ):
-
-            if i + 1 < len(lines):
-
-                address_parts.append(
-                    lines[i + 1]
-                )
-
-        # ----------------------------------------------------
-        # City / District / State / PIN
-        # ----------------------------------------------------
-
-        elif compact.startswith(
-            "city/district/statewithpincode"
-        ):
-
-            if i + 1 < len(lines):
-
-                address_parts.append(
-                    lines[i + 1]
-                )
-
-    # ========================================================
-    # FALLBACK ADDRESS FORMAT
-    # ========================================================
-
-    if not address_parts:
-
-        for i, line in enumerate(
-            lines
-        ):
-
-            if re.match(
-                r"^(D/O|S/O|W/O|C/O)\b",
-                line,
-                re.I,
+            if compact.startswith(
+                normalize_for_match(label)
             ):
 
-                address_parts = lines[
-                    i:i + 3
-                ]
+                matched = True
+                found_address_label = True
+
+                # ------------------------------------------------
+                # Same line may contain value after colon.
+                # ------------------------------------------------
+
+                current_line = lines[i]
+
+                parts = re.split(
+                    r":\s*",
+                    current_line,
+                    maxsplit=1
+                )
+
+                if (
+                    len(parts) == 2
+                    and clean(parts[1])
+                ):
+
+                    address_parts.append(
+                        clean(parts[1])
+                    )
+
+                # ------------------------------------------------
+                # Otherwise next 1-2 lines
+                # ------------------------------------------------
+
+                else:
+
+                    for j in range(
+                        i + 1,
+                        min(
+                            i + 3,
+                            len(lines)
+                        )
+                    ):
+
+                        candidate = clean(
+                            lines[j]
+                        )
+
+                        if not candidate:
+                            continue
+
+                        # Stop if next field label begins.
+                        if re.match(
+                            r"^(account|customer\s*id|"
+                            r"customer\s*name|sex|"
+                            r"mobile|aadhaar|date\s*of\s*birth|"
+                            r"pin\s*code)\b",
+                            candidate,
+                            re.IGNORECASE
+                        ):
+                            break
+
+                        address_parts.append(
+                            candidate
+                        )
 
                 break
 
-    # ========================================================
-    # JOIN ADDRESS
-    # ========================================================
+        if matched:
+            continue
+
+    # --------------------------------------------------------
+    # Fallback: D/O, S/O, W/O, C/O format
+    # --------------------------------------------------------
+
+    if not address_parts:
+
+        relation_re = re.compile(
+            r"^(D/O|S/O|W/O|C/O)\b",
+            re.IGNORECASE
+        )
+
+        for i, line in enumerate(lines):
+
+            if relation_re.search(line):
+
+                # Collect several consecutive lines.
+                for j in range(
+                    i,
+                    min(
+                        i + 6,
+                        len(lines)
+                    )
+                ):
+
+                    candidate = clean(
+                        lines[j]
+                    )
+
+                    if not candidate:
+                        continue
+
+                    # Stop at obvious unrelated fields.
+                    if (
+                        j > i
+                        and re.match(
+                            r"^(account|customer\s*id|"
+                            r"customer\s*name|mobile|"
+                            r"aadhaar|date\s*of\s*birth)\b",
+                            candidate,
+                            re.IGNORECASE
+                        )
+                    ):
+                        break
+
+                    address_parts.append(
+                        candidate
+                    )
+
+                break
+
+    # --------------------------------------------------------
+    # Last fallback:
+    #
+    # Search lines containing a 6-digit PIN.
+    # --------------------------------------------------------
+
+    if not address_parts:
+
+        for line in lines:
+
+            if re.search(
+                r"(?<!\d)\d{6}(?!\d)",
+                line
+            ):
+
+                address_parts.append(
+                    line
+                )
+
+    # --------------------------------------------------------
+    # Join address
+    # --------------------------------------------------------
 
     address = clean(
         " ".join(
@@ -323,32 +788,220 @@ def extract_aof(pdf_bytes):
         )
     )
 
-    # ========================================================
-    # REMOVE ONLY 01716, 195
-    # ========================================================
+    address = clean_address(
+        address
+    )
+
+    return address
+
+
+# ============================================================
+# EXTRACT PIN CODE
+# ============================================================
+
+def extract_pin_code(
+    lines,
+    address,
+):
+
+    # --------------------------------------------------------
+    # 1. Search explicit PIN labels in complete PDF
+    # --------------------------------------------------------
+
+    full_text = "\n".join(
+        lines
+    )
+
+    pin = extract_pin_from_text(
+        full_text
+    )
+
+    if pin:
+        return pin
+
+    # --------------------------------------------------------
+    # 2. Search address
+    # --------------------------------------------------------
+
+    pin = extract_pin_from_text(
+        address
+    )
+
+    if pin:
+        return pin
+
+    # --------------------------------------------------------
+    # 3. Search lines near address labels
+    # --------------------------------------------------------
+
+    address_label_re = re.compile(
+        r"flat\s*no"
+        r"|bldg"
+        r"|street"
+        r"|road"
+        r"|locality"
+        r"|city"
+        r"|district"
+        r"|state"
+        r"|pincode"
+        r"|pin\s*code",
+        re.IGNORECASE
+    )
+
+    for i, line in enumerate(lines):
+
+        if not address_label_re.search(
+            line
+        ):
+            continue
+
+        for candidate in lines[
+            i:i + 6
+        ]:
+
+            matches = re.findall(
+                r"(?<!\d)(\d{6})(?!\d)",
+                candidate
+            )
+
+            if matches:
+                return matches[-1]
+
+    # --------------------------------------------------------
+    # 4. Final fallback:
+    #
+    # Search from bottom of PDF upward.
+    #
+    # This is useful when the AOF places PIN at the
+    # end of the address but changes the exact label.
+    # --------------------------------------------------------
+
+    for line in reversed(lines):
+
+        matches = re.findall(
+            r"(?<!\d)(\d{6})(?!\d)",
+            line
+        )
+
+        if matches:
+
+            # Ignore obvious dates such as 2026xx etc.
+            # A PIN must be exactly six digits.
+            return matches[-1]
+
+    return ""
+
+
+# ============================================================
+# MAIN EXTRACTION
+# ============================================================
+
+def extract_aof(pdf_bytes):
+
+    # --------------------------------------------------------
+    # Read PDF
+    # --------------------------------------------------------
+
+    text = lines_from_pdf(
+        pdf_bytes
+    )
+
+    lines = get_lines(
+        text
+    )
+
+    if not lines:
+
+        raise ValueError(
+            "No selectable text found in PDF."
+        )
+
+    # --------------------------------------------------------
+    # Extract fields
+    # --------------------------------------------------------
+
+    name = extract_name(
+        lines
+    )
+
+    account = extract_account_number(
+        lines
+    )
+
+    customer_id = extract_customer_id(
+        lines
+    )
+
+    dob = extract_dob(
+        lines
+    )
+
+    aadhaar = extract_aadhaar(
+        lines
+    )
+
+    mobile = extract_mobile(
+        lines
+    )
+
+    # --------------------------------------------------------
+    # Address
+    # --------------------------------------------------------
+
+    address = extract_address(
+        lines
+    )
 
     address = clean_address(
         address
     )
 
-    # ========================================================
-    # PIN CODE
-    # ========================================================
+    # --------------------------------------------------------
+    # PIN
+    # --------------------------------------------------------
 
-    pin_match = re.search(
-        r"\b(\d{6})\b\s*$",
-        address,
+    pin = extract_pin_code(
+        lines,
+        address
     )
 
-    pin = (
-        pin_match.group(1)
-        if pin_match
-        else ""
+    # --------------------------------------------------------
+    # If PIN was found separately but is not present in
+    # address, append it only when the address has no PIN.
+    #
+    # This makes final DOCX verification reliable.
+    # --------------------------------------------------------
+
+    if (
+        pin
+        and not re.search(
+            r"(?<!\d)"
+            + re.escape(pin)
+            + r"(?!\d)",
+            address
+        )
+    ):
+
+        if address:
+            address = (
+                address.rstrip(" ,")
+                + ", "
+                + pin
+            )
+        else:
+            address = pin
+
+    # --------------------------------------------------------
+    # Clean address one final time
+    # --------------------------------------------------------
+
+    address = clean_address(
+        address
     )
 
-    # ========================================================
-    # REQUIRED DATA
-    # ========================================================
+    # --------------------------------------------------------
+    # Required fields
+    # --------------------------------------------------------
 
     required = {
         "name": name,
@@ -358,20 +1011,22 @@ def extract_aof(pdf_bytes):
         "pin_code": pin,
     }
 
-    # ========================================================
-    # VALIDATION
-    # ========================================================
+    # --------------------------------------------------------
+    # Validation
+    # --------------------------------------------------------
 
     checks = {
         "all_required": all(
-            bool(v)
-            for v in required.values()
+            bool(
+                str(value).strip()
+            )
+            for value in required.values()
         ),
 
         "account_format": bool(
             re.fullmatch(
                 r"\d{8,20}",
-                account,
+                account
             )
         ),
 
@@ -379,13 +1034,14 @@ def extract_aof(pdf_bytes):
             re.fullmatch(
                 r"[A-Z0-9]{6,30}",
                 customer_id,
+                flags=re.IGNORECASE
             )
         ),
 
         "pin_format": bool(
             re.fullmatch(
                 r"\d{6}",
-                pin,
+                pin
             )
         ),
 
@@ -394,19 +1050,21 @@ def extract_aof(pdf_bytes):
         "aadhaar": aadhaar,
     }
 
-    # ========================================================
-    # REQUIRED FIELD CHECK
-    # ========================================================
+    # --------------------------------------------------------
+    # Required data check
+    # --------------------------------------------------------
 
     if not checks[
         "all_required"
     ]:
 
         missing = [
-            k
-            for k, v
+            key
+            for key, value
             in required.items()
-            if not v
+            if not str(
+                value
+            ).strip()
         ]
 
         raise ValueError(
@@ -416,9 +1074,9 @@ def extract_aof(pdf_bytes):
             )
         )
 
-    # ========================================================
-    # ACCOUNT VALIDATION
-    # ========================================================
+    # --------------------------------------------------------
+    # Account validation
+    # --------------------------------------------------------
 
     if not checks[
         "account_format"
@@ -428,9 +1086,9 @@ def extract_aof(pdf_bytes):
             "Account Number validation failed."
         )
 
-    # ========================================================
-    # CUSTOMER ID VALIDATION
-    # ========================================================
+    # --------------------------------------------------------
+    # Customer ID validation
+    # --------------------------------------------------------
 
     if not checks[
         "customer_id_format"
@@ -440,9 +1098,9 @@ def extract_aof(pdf_bytes):
             "Customer ID validation failed."
         )
 
-    # ========================================================
-    # PIN VALIDATION
-    # ========================================================
+    # --------------------------------------------------------
+    # PIN validation
+    # --------------------------------------------------------
 
     if not checks[
         "pin_format"
@@ -452,11 +1110,11 @@ def extract_aof(pdf_bytes):
             "PIN Code validation failed."
         )
 
-    # ========================================================
-    # RETURN
-    # ========================================================
+    # --------------------------------------------------------
+    # Return
+    # --------------------------------------------------------
 
     return (
         required,
-        checks,
+        checks
     )
