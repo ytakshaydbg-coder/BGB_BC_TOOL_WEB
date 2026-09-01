@@ -5,20 +5,27 @@ from pathlib import Path
 
 
 # ============================================================
-# ONLY THESE FIELDS CAN CHANGE
+# FIELDS WHICH ARE ALLOWED TO CHANGE
 # ============================================================
 
-PLACEHOLDERS = {
-    "{{ACCOUNT_NO}}": "account_number",
-    "{{CUSTOMER_ID}}": "customer_id",
-    "{{NAME}}": "name",
-    "{{ADDRESS}}": "address",
-    "{{PIN_CODE}}": "pin_code",
+PLACEHOLDER_FIELDS = {
+    "ACCOUNT_NO": "account_number",
+    "ACCOUNT NUMBER": "account_number",
+
+    "CUSTOMER_ID": "customer_id",
+    "CUSTOMER ID": "customer_id",
+
+    "NAME": "name",
+
+    "ADDRESS": "address",
+
+    "PIN_CODE": "pin_code",
+    "PIN CODE": "pin_code",
 }
 
 
 # ============================================================
-# THESE FIELDS ARE LOCKED
+# LOCKED / FIXED TEMPLATE VALUES
 # ============================================================
 
 FIXED_VALUES = [
@@ -34,8 +41,10 @@ FIXED_VALUES = [
 # ============================================================
 
 def escape_xml(value):
+    value = "" if value is None else str(value)
+
     return (
-        str(value)
+        value
         .replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
@@ -49,13 +58,12 @@ def escape_xml(value):
 # ============================================================
 
 def normalize_text(text):
-
     if text is None:
         return ""
 
     text = str(text)
 
-    # XML entities
+    # Decode common XML entities
     text = (
         text
         .replace("&amp;", "&")
@@ -66,7 +74,7 @@ def normalize_text(text):
         .replace("\xa0", " ")
     )
 
-    # Normalize all common dash characters
+    # Normalize dash characters
     for dash in "‐-‒–—―−﹘﹣－":
         text = text.replace(dash, "-")
 
@@ -77,68 +85,133 @@ def normalize_text(text):
 
 
 # ============================================================
-# GET VISIBLE TEXT FROM XML
+# CLEAN CUSTOMER DATA
+# ============================================================
+
+def clean_customer_data(data):
+    cleaned = dict(data)
+
+    for key in [
+        "account_number",
+        "customer_id",
+        "name",
+        "address",
+        "pin_code",
+    ]:
+        value = cleaned.get(key, "")
+
+        if value is None:
+            value = ""
+
+        value = str(value).strip()
+
+        # Remove unwanted address fragment specifically requested.
+        if key == "address":
+            value = re.sub(
+                r"\s*,?\s*01716\s*,?\s*195\b",
+                "",
+                value,
+                flags=re.IGNORECASE,
+            )
+
+            value = re.sub(
+                r"\s{2,}",
+                " ",
+                value,
+            )
+
+            value = re.sub(
+                r"\s+,",
+                ",",
+                value,
+            )
+
+            value = re.sub(
+                r",\s*,",
+                ",",
+                value,
+            )
+
+            value = value.strip(" ,")
+
+        cleaned[key] = value
+
+    return cleaned
+
+
+# ============================================================
+# WORD XML TEXT NODES
+# ============================================================
+
+TEXT_NODE_RE = re.compile(
+    r"<w:t\b([^>]*)>(.*?)</w:t>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+
+
+def get_text_nodes(xml):
+    return list(TEXT_NODE_RE.finditer(xml))
+
+
+# ============================================================
+# GET VISIBLE WORD TEXT
 # ============================================================
 
 def get_visible_text(xml):
+    parts = []
 
-    nodes = re.findall(
-        r"<w:t\b[^>]*>(.*?)</w:t>",
-        xml,
-        flags=re.IGNORECASE | re.DOTALL,
+    for node in get_text_nodes(xml):
+        parts.append(node.group(2))
+
+    return normalize_text("".join(parts))
+
+
+# ============================================================
+# PLACEHOLDER REGEX
+#
+# Handles:
+# {{CUSTOMER_ID}}
+# {{ CUSTOMER_ID }}
+# {{CUSTOMER ID}}
+# {{ CUSTOMER ID }}
+# ============================================================
+
+def placeholder_regex(field_name):
+    field_name = field_name.replace("_", r"[\s_]*")
+
+    return re.compile(
+        r"\{\{\s*"
+        + field_name
+        + r"\s*\}\}",
+        flags=re.IGNORECASE,
     )
 
-    return normalize_text(
-        "".join(nodes)
-    )
-
 
 # ============================================================
-# GET ALL TEXT-RUN NODES
+# REPLACE PLACEHOLDER
+#
+# Works even when Word has split the placeholder over
+# multiple <w:t> runs.
 # ============================================================
 
-def get_text_nodes(xml):
-
-    return list(
-        re.finditer(
-            r"<w:t\b([^>]*)>(.*?)</w:t>",
-            xml,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-    )
-
-
-# ============================================================
-# REPLACE PLACEHOLDER ACROSS WORD RUNS
-# ============================================================
-
-def replace_placeholder(
-    xml,
-    placeholder,
-    replacement,
-):
-
+def replace_placeholder(xml, field_name, replacement):
     nodes = get_text_nodes(xml)
 
     if not nodes:
         return xml, False
 
     # --------------------------------------------------------
-    # Build complete visible text
+    # Build visible text from all runs
     # --------------------------------------------------------
 
     visible = ""
-
     ranges = []
 
     for node in nodes:
-
         text = node.group(2)
 
         start = len(visible)
-
         visible += text
-
         end = len(visible)
 
         ranges.append(
@@ -153,31 +226,24 @@ def replace_placeholder(
     # Find placeholder
     # --------------------------------------------------------
 
-    position = visible.find(
-        placeholder
-    )
+    pattern = placeholder_regex(field_name)
 
-    if position == -1:
+    match = pattern.search(visible)
+
+    if not match:
         return xml, False
 
-    end_position = (
-        position
-        + len(placeholder)
-    )
+    position = match.start()
+    end_position = match.end()
 
     # --------------------------------------------------------
-    # Find affected XML text runs
+    # Find all runs affected by placeholder
     # --------------------------------------------------------
 
     affected = []
 
     for node, start, end in ranges:
-
-        if (
-            end > position
-            and start < end_position
-        ):
-
+        if end > position and start < end_position:
             affected.append(
                 (
                     node,
@@ -190,57 +256,43 @@ def replace_placeholder(
         return xml, False
 
     first_node, first_start, _ = affected[0]
-
     last_node, last_start, _ = affected[-1]
 
     first_text = first_node.group(2)
-
     last_text = last_node.group(2)
 
     # --------------------------------------------------------
     # Preserve text before placeholder
     # --------------------------------------------------------
 
-    prefix_length = (
-        position
-        - first_start
-    )
+    prefix_length = position - first_start
 
-    prefix = first_text[
-        :prefix_length
-    ]
+    prefix = first_text[:prefix_length]
 
     # --------------------------------------------------------
     # Preserve text after placeholder
     # --------------------------------------------------------
 
-    suffix_start = (
-        end_position
-        - last_start
-    )
+    suffix_start = end_position - last_start
 
-    suffix = last_text[
-        suffix_start:
-    ]
+    suffix = last_text[suffix_start:]
 
     # --------------------------------------------------------
-    # New content
+    # New text
     # --------------------------------------------------------
 
-    new_content = (
+    new_text = (
         prefix
         + str(replacement)
         + suffix
     )
 
-    new_content = escape_xml(
-        new_content
-    )
+    new_text = escape_xml(new_text)
 
     replacements = []
 
     # --------------------------------------------------------
-    # First run gets replacement
+    # Put replacement into first affected run
     # --------------------------------------------------------
 
     replacements.append(
@@ -248,41 +300,42 @@ def replace_placeholder(
             first_node.start(),
             first_node.end(),
             (
-                f"<w:t{first_node.group(1)}>"
-                f"{new_content}"
-                f"</w:t>"
+                "<w:t"
+                + first_node.group(1)
+                + ">"
+                + new_text
+                + "</w:t>"
             ),
         )
     )
 
     # --------------------------------------------------------
-    # Other affected runs become empty
+    # Clear remaining affected runs
     # --------------------------------------------------------
 
     for node, _, _ in affected[1:]:
-
         replacements.append(
             (
                 node.start(),
                 node.end(),
                 (
-                    f"<w:t{node.group(1)}>"
-                    f"</w:t>"
+                    "<w:t"
+                    + node.group(1)
+                    + "></w:t>"
                 ),
             )
         )
 
     # --------------------------------------------------------
-    # Apply backwards
+    # Apply replacements backwards
     # --------------------------------------------------------
 
-    for start, end, new_xml in reversed(
+    for start, end, replacement_xml in reversed(
         replacements
     ):
-
         xml = (
             xml[:start]
-            + new_xml
+            + replacement_xml
             + xml[end:]
         )
 
@@ -290,53 +343,77 @@ def replace_placeholder(
 
 
 # ============================================================
-# REPLACE ALL PLACEHOLDERS IN ONE XML PART
+# REPLACE ALL SUPPORTED PLACEHOLDERS
 # ============================================================
 
-def replace_all_placeholders(
-    xml,
-    data,
-):
+def replace_all_placeholders(xml, data):
+    changed_any = False
 
-    for placeholder, field in PLACEHOLDERS.items():
+    for field_name, data_key in PLACEHOLDER_FIELDS.items():
 
-        # Keep replacing until this placeholder no longer exists.
+        # Continue until no matching placeholder remains.
         while True:
 
-            new_xml, changed = (
-                replace_placeholder(
-                    xml,
-                    placeholder,
-                    data[field],
-                )
+            new_xml, changed = replace_placeholder(
+                xml,
+                field_name,
+                data[data_key],
             )
 
             if not changed:
                 break
 
             xml = new_xml
+            changed_any = True
 
-    return xml
+    return xml, changed_any
 
 
 # ============================================================
 # FIND REMAINING PLACEHOLDERS
 # ============================================================
 
-def find_remaining_placeholders(
-    xml,
-):
+def find_remaining_placeholders(xml):
+    visible = get_visible_text(xml)
 
-    visible = get_visible_text(
-        xml
+    matches = re.findall(
+        r"\{\{\s*[A-Z0-9_ ]+\s*\}\}",
+        visible,
+        flags=re.IGNORECASE,
     )
 
     return sorted(
         set(
-            re.findall(
-                r"\{\{[A-Z0-9_]+\}\}",
-                visible,
-            )
+            normalize_text(x)
+            for x in matches
+        )
+    )
+
+
+# ============================================================
+# COLLECT ALL WORD XML PARTS
+# ============================================================
+
+def get_word_xml_names(files):
+    return [
+        name
+        for name in files
+        if (
+            name.startswith("word/")
+            and name.endswith(".xml")
+        )
+    ]
+
+
+# ============================================================
+# COMBINE VISIBLE TEXT
+# ============================================================
+
+def combined_visible_text(xml_parts):
+    return normalize_text(
+        " ".join(
+            get_visible_text(xml)
+            for xml in xml_parts
         )
     )
 
@@ -345,37 +422,19 @@ def find_remaining_placeholders(
 # VERIFY LOCKED FIELDS
 # ============================================================
 
-def verify_locked_fields(
-    all_xml_parts,
-):
-
-    complete_text = ""
-
-    for xml in all_xml_parts:
-
-        complete_text += " "
-
-        complete_text += get_visible_text(
-            xml
-        )
-
-    complete_text = normalize_text(
-        complete_text
+def verify_locked_fields(xml_parts):
+    complete_text = combined_visible_text(
+        xml_parts
     )
 
     missing = []
 
     for fixed in FIXED_VALUES:
 
-        expected = normalize_text(
-            fixed
-        )
+        expected = normalize_text(fixed)
 
         if expected not in complete_text:
-
-            missing.append(
-                fixed
-            )
+            missing.append(fixed)
 
     return missing
 
@@ -384,23 +443,9 @@ def verify_locked_fields(
 # VERIFY CUSTOMER FIELDS
 # ============================================================
 
-def verify_customer_fields(
-    all_xml_parts,
-    data,
-):
-
-    complete_text = ""
-
-    for xml in all_xml_parts:
-
-        complete_text += " "
-
-        complete_text += get_visible_text(
-            xml
-        )
-
-    complete_text = normalize_text(
-        complete_text
+def verify_customer_fields(xml_parts, data):
+    complete_text = combined_visible_text(
+        xml_parts
     )
 
     failed = []
@@ -414,41 +459,137 @@ def verify_customer_fields(
     ]:
 
         expected = normalize_text(
-            data[field]
+            data.get(field, "")
         )
 
-        if expected not in complete_text:
+        if not expected:
+            failed.append(field)
+            continue
 
-            failed.append(
-                field
-            )
+        if expected not in complete_text:
+            failed.append(field)
 
     return failed
+
+
+# ============================================================
+# WRITE DOCX
+# ============================================================
+
+def write_docx(files, output):
+    if hasattr(output, "write"):
+
+        with zipfile.ZipFile(
+            output,
+            "w",
+            zipfile.ZIP_DEFLATED,
+        ) as destination:
+
+            for name, content in files.items():
+                destination.writestr(
+                    name,
+                    content,
+                )
+
+    else:
+
+        output = Path(output)
+
+        output.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        with zipfile.ZipFile(
+            output,
+            "w",
+            zipfile.ZIP_DEFLATED,
+        ) as destination:
+
+            for name, content in files.items():
+                destination.writestr(
+                    name,
+                    content,
+                )
 
 
 # ============================================================
 # BUILD DOCX
 # ============================================================
 
-def build_docx(
-    template_file,
-    output,
-    data,
-):
+def build_docx(template_file, output, data):
 
-    template_file = Path(
-        template_file
-    )
+    template_file = Path(template_file)
 
     if not template_file.exists():
-
         raise FileNotFoundError(
             "Template not found: "
             + str(template_file)
         )
 
     # --------------------------------------------------------
-    # Open DOCX
+    # Clean data first
+    # --------------------------------------------------------
+
+    data = clean_customer_data(data)
+
+    # --------------------------------------------------------
+    # Required fields
+    # --------------------------------------------------------
+
+    required_fields = [
+        "account_number",
+        "customer_id",
+        "name",
+        "address",
+        "pin_code",
+    ]
+
+    for field in required_fields:
+
+        if field not in data:
+            raise ValueError(
+                "Missing required field: "
+                + field
+            )
+
+        if not str(data[field]).strip():
+            raise ValueError(
+                "Empty required field: "
+                + field
+            )
+
+    # --------------------------------------------------------
+    # Basic validation
+    # --------------------------------------------------------
+
+    if not re.fullmatch(
+        r"\d{8,20}",
+        str(data["account_number"]).strip(),
+    ):
+        raise ValueError(
+            "Account Number validation failed."
+        )
+
+    if not re.fullmatch(
+        r"[A-Z0-9]{6,30}",
+        str(data["customer_id"]).strip(),
+        flags=re.IGNORECASE,
+    ):
+        raise ValueError(
+            "Customer ID validation failed."
+        )
+
+    if not re.fullmatch(
+        r"\d{6}",
+        str(data["pin_code"]).strip(),
+    ):
+        raise ValueError(
+            "PIN Code validation failed."
+        )
+
+    # --------------------------------------------------------
+    # Open original DOCX
     # --------------------------------------------------------
 
     with zipfile.ZipFile(
@@ -465,81 +606,35 @@ def build_docx(
     # Validate DOCX
     # --------------------------------------------------------
 
-    if (
-        "word/document.xml"
-        not in files
-    ):
-
+    if "word/document.xml" not in files:
         raise ValueError(
-            "Invalid DOCX: "
-            "word/document.xml not found."
+            "Invalid DOCX: word/document.xml not found."
         )
 
     # --------------------------------------------------------
-    # Validate input
+    # Process Word XML parts
     # --------------------------------------------------------
 
-    required_fields = [
-        "account_number",
-        "customer_id",
-        "name",
-        "address",
-        "pin_code",
-    ]
+    xml_names = get_word_xml_names(files)
 
-    for field in required_fields:
-
-        if field not in data:
-
-            raise ValueError(
-                "Missing required field: "
-                + field
-            )
-
-        if (
-            data[field] is None
-            or str(data[field]).strip() == ""
-        ):
-
-            raise ValueError(
-                "Empty required field: "
-                + field
-            )
-
-    # --------------------------------------------------------
-    # Process ALL Word XML parts
-    #
-    # This includes:
-    # document.xml
-    # headers
-    # footers
-    # etc.
-    # --------------------------------------------------------
-
-    xml_names = []
-
-    for name in files:
-
-        if (
-            name.startswith("word/")
-            and name.endswith(".xml")
-        ):
-
-            xml_names.append(
-                name
-            )
-
-    # --------------------------------------------------------
-    # Replace placeholders
-    # --------------------------------------------------------
+    if not xml_names:
+        raise ValueError(
+            "No Word XML document parts found."
+        )
 
     for name in xml_names:
 
-        xml = files[name].decode(
-            "utf-8"
-        )
+        try:
+            xml = files[name].decode(
+                "utf-8"
+            )
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                "Unable to decode Word XML: "
+                + name
+            ) from exc
 
-        xml = replace_all_placeholders(
+        xml, _ = replace_all_placeholders(
             xml,
             data,
         )
@@ -552,30 +647,20 @@ def build_docx(
     # Collect processed XML
     # --------------------------------------------------------
 
-    all_xml_parts = []
-
-    for name in xml_names:
-
-        xml = files[name].decode(
-            "utf-8"
-        )
-
-        all_xml_parts.append(
-            xml
-        )
+    xml_parts = [
+        files[name].decode("utf-8")
+        for name in xml_names
+    ]
 
     # --------------------------------------------------------
-    # Check remaining placeholders
+    # Remaining placeholders
     # --------------------------------------------------------
 
     remaining = []
 
-    for xml in all_xml_parts:
-
+    for xml in xml_parts:
         remaining.extend(
-            find_remaining_placeholders(
-                xml
-            )
+            find_remaining_placeholders(xml)
         )
 
     remaining = sorted(
@@ -583,130 +668,99 @@ def build_docx(
     )
 
     if remaining:
-
         raise ValueError(
             "Unmapped placeholders remain: "
             + ", ".join(remaining)
         )
 
     # --------------------------------------------------------
-    # Check locked fields
+    # Locked field verification
     # --------------------------------------------------------
 
-    missing_locked = (
-        verify_locked_fields(
-            all_xml_parts
-        )
+    missing_locked = verify_locked_fields(
+        xml_parts
     )
 
     if missing_locked:
-
         raise ValueError(
-            "A locked field was changed "
-            "or removed: "
+            "A locked field was changed or removed: "
             + ", ".join(missing_locked)
         )
 
     # --------------------------------------------------------
-    # Check customer fields
+    # Customer field verification
     # --------------------------------------------------------
 
-    failed_customer_fields = (
-        verify_customer_fields(
-            all_xml_parts,
-            data,
-        )
+    failed_customer_fields = verify_customer_fields(
+        xml_parts,
+        data,
     )
 
     if failed_customer_fields:
-
         raise ValueError(
             "Customer data verification failed: "
-            + ", ".join(
-                failed_customer_fields
-            )
+            + ", ".join(failed_customer_fields)
         )
 
     # --------------------------------------------------------
-    # Create final DOCX
+    # Write final DOCX
     # --------------------------------------------------------
 
-    if hasattr(
+    write_docx(
+        files,
         output,
-        "write",
-    ):
-
-        with zipfile.ZipFile(
-            output,
-            "w",
-            zipfile.ZIP_DEFLATED,
-        ) as destination:
-
-            for name, content in files.items():
-
-                destination.writestr(
-                    name,
-                    content,
-                )
-
-    else:
-
-        output = Path(
-            output
-        )
-
-        output.parent.mkdir(
-            parents=True,
-            exist_ok=True
-        )
-
-        with zipfile.ZipFile(
-            output,
-            "w",
-            zipfile.ZIP_DEFLATED,
-        ) as destination:
-
-            for name, content in files.items():
-
-                destination.writestr(
-                    name,
-                    content,
-                )
+    )
 
 
 # ============================================================
-# FINAL VERIFICATION
+# FINAL DOCX VERIFICATION
 # ============================================================
 
-def verify_result(
-    docx_bytes,
-    data,
-):
+def verify_result(docx_bytes, data):
 
-    with zipfile.ZipFile(
-        io.BytesIO(docx_bytes),
-        "r",
-    ) as archive:
+    data = clean_customer_data(data)
 
-        xml_parts = []
+    try:
 
-        for name in archive.namelist():
+        with zipfile.ZipFile(
+            io.BytesIO(docx_bytes),
+            "r",
+        ) as archive:
 
-            if (
-                name.startswith("word/")
-                and name.endswith(".xml")
-            ):
+            xml_parts = []
 
-                xml_parts.append(
-                    archive.read(
-                        name
-                    ).decode(
-                        "utf-8"
-                    )
-                )
+            for name in archive.namelist():
+
+                if (
+                    name.startswith("word/")
+                    and name.endswith(".xml")
+                ):
+
+                    try:
+                        xml_parts.append(
+                            archive.read(
+                                name
+                            ).decode(
+                                "utf-8"
+                            )
+                        )
+
+                    except UnicodeDecodeError:
+                        continue
+
+    except zipfile.BadZipFile as exc:
+
+        raise ValueError(
+            "Generated DOCX is not a valid ZIP/DOCX file."
+        ) from exc
+
+    if not xml_parts:
+        raise ValueError(
+            "Final DOCX contains no Word XML parts."
+        )
 
     # --------------------------------------------------------
-    # Customer verification
+    # Verify customer data
     # --------------------------------------------------------
 
     failed = verify_customer_fields(
@@ -715,44 +769,35 @@ def verify_result(
     )
 
     if failed:
-
         raise ValueError(
             "Final DOCX verification failed for: "
             + ", ".join(failed)
         )
 
     # --------------------------------------------------------
-    # Locked-field verification
+    # Verify locked fields
     # --------------------------------------------------------
 
-    missing_locked = (
-        verify_locked_fields(
-            xml_parts
-        )
+    missing_locked = verify_locked_fields(
+        xml_parts
     )
 
     if missing_locked:
-
         raise ValueError(
             "Final DOCX verification failed. "
             "Locked field missing: "
-            + ", ".join(
-                missing_locked
-            )
+            + ", ".join(missing_locked)
         )
 
     # --------------------------------------------------------
-    # Placeholder verification
+    # Verify no placeholders remain
     # --------------------------------------------------------
 
     remaining = []
 
     for xml in xml_parts:
-
         remaining.extend(
-            find_remaining_placeholders(
-                xml
-            )
+            find_remaining_placeholders(xml)
         )
 
     remaining = sorted(
@@ -760,12 +805,9 @@ def verify_result(
     )
 
     if remaining:
-
         raise ValueError(
             "Final DOCX still contains placeholders: "
-            + ", ".join(
-                remaining
-            )
+            + ", ".join(remaining)
         )
 
     return True
