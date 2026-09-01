@@ -9,11 +9,11 @@ from pathlib import Path
 # ============================================================
 
 PLACEHOLDERS = {
-    "{{FIELD_1}}": "field_1",
-    "{{FIELD_2}}": "field_2",
-    "{{FIELD_3}}": "field_3",
-    "{{FIELD_4}}": "field_4",
-    "{{FIELD_5}}": "field_5",
+    "{{ACCOUNT_NO}}": "account_number",
+    "{{CUSTOMER_ID}}": "customer_id",
+    "{{NAME}}": "name",
+    "{{ADDRESS}}": "address",
+    "{{PIN_CODE}}": "pin_code",
 }
 
 
